@@ -1,0 +1,236 @@
+/**
+ * ============================================================================
+ * Zoho Projects to Zoho Sign Integration
+ * ============================================================================
+ * 
+ * Description:
+ *   Fetches PDF attachments from a Zoho Projects task, downloads them from 
+ *   Zoho WorkDrive, uploads to Zoho Sign as a single signing request, and 
+ *   sends to client for e-signature.
+ * 
+ * Author: Rafiullah Nikzad
+ * Company: CloudZ Technologies
+ * Version: 1.0.0
+ * Created: 2025
+ * 
+ * Prerequisites:
+ *   - Zoho Projects connection: "projects_conn"
+ *   - Zoho WorkDrive connection: "workdriveconn"
+ *   - Zoho Sign connection: "zohosign"
+ * 
+ * Usage:
+ *   Execute as standalone function or trigger via workflow when task is completed.
+ * 
+ * ============================================================================
+ */
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+// Update these values for your specific use case
+
+portalId = "bruagdesignfactoryag";           // Your Zoho Projects portal ID
+projectId = "300973000000580009";             // Project ID containing the task
+taskId = "300973000000576055";                // Task ID with PDF attachments
+clientEmail = "clientfriends2023@gmail.com";  // Recipient's email address
+clientName = "Client Name";                   // Recipient's display name
+
+// ============================================================================
+// STEP 1: GET TASK ATTACHMENTS FROM ZOHO PROJECTS
+// ============================================================================
+// Fetches the list of all files attached to the specified task
+
+attachUrl = "https://projectsapi.zoho.eu/api/v3/portal/" + portalId + "/projects/" + projectId + "/tasks/" + taskId + "/attachments";
+
+attachResponse = invokeurl
+[
+    url: attachUrl
+    type: GET
+    connection: "projects_conn"
+];
+
+attachmentsList = attachResponse.get("attachment");
+info "Found " + attachmentsList.size() + " attachments";
+
+// ============================================================================
+// STEP 2: DOWNLOAD ALL PDFs FROM ZOHO WORKDRIVE
+// ============================================================================
+// Iterates through attachments and downloads only PDF files
+// Files attached to Projects tasks are stored in WorkDrive
+
+pdfFilesList = List();   // Stores the actual file content (binary)
+pdfNames = List();       // Stores file names for logging
+
+for each attachment in attachmentsList
+{
+    fileName = attachment.get("name");
+    fileType = attachment.get("type");
+    workdriveFileId = attachment.get("third_party_file_id");
+    
+    // Filter for PDF files only
+    if(fileType.contains("pdf"))
+    {
+        info "Downloading PDF: " + fileName;
+        
+        // Construct WorkDrive download URL
+        wdDownloadUrl = "https://workdrive.zoho.eu/api/v1/download/" + workdriveFileId;
+        
+        // Set header to receive binary content
+        headerMap = Map();
+        headerMap.put("Accept", "application/octet-stream");
+        
+        // Download the file content
+        fileContent = invokeurl
+        [
+            url: wdDownloadUrl
+            type: GET
+            headers: headerMap
+            connection: "workdriveconn"
+        ];
+        
+        // Add to collections
+        pdfFilesList.add(fileContent);
+        pdfNames.add(fileName);
+        info "Downloaded: " + fileName;
+    }
+}
+
+info "Total PDFs collected: " + pdfFilesList.size();
+
+// ============================================================================
+// STEP 3: UPLOAD ALL PDFs TO ZOHO SIGN
+// ============================================================================
+// Creates a single signing request containing all PDF documents
+// This allows the client to review and sign all documents in one session
+
+if(pdfFilesList.size() > 0)
+{
+    // Upload all PDFs as a single document request
+    signResponse = zoho.sign.createDocument(pdfFilesList, Map(), "zohosign");
+    info "Upload Response: " + signResponse;
+    
+    if(signResponse.get("status") == "success")
+    {
+        // Extract request and document IDs
+        requestId = signResponse.get("requests").get("request_id");
+        documentIds = signResponse.get("requests").get("document_ids");
+        
+        info "Request ID: " + requestId;
+        info "Total Documents in Request: " + documentIds.size();
+        
+        // ====================================================================
+        // STEP 4: GET SIGNATURE FIELD TYPE ID
+        // ====================================================================
+        // Retrieves the field type ID for "Signature" field
+        // Required for adding signature fields to the document
+        
+        fieldTypesResp = zoho.sign.getFieldIds("zohosign");
+        signFieldId = "";
+        
+        for each ft in fieldTypesResp.get("field_types")
+        {
+            if(ft.get("field_type_name") == "Signature")
+            {
+                signFieldId = ft.get("field_type_id");
+                break;
+            }
+        }
+        info "Signature Field ID: " + signFieldId;
+        
+        // ====================================================================
+        // STEP 5: ADD SIGNATURE FIELD TO LAST PAGE
+        // ====================================================================
+        // Places the signature field on the last page of the last document
+        // Coordinates are calibrated for documents with "Unterschrift:" label
+        
+        // Get the last document (where signature will be placed)
+        lastDocIndex = documentIds.size() - 1;
+        lastDocId = documentIds.get(lastDocIndex).get("document_id");
+        lastDocPages = documentIds.get(lastDocIndex).get("total_pages");
+        lastPageNo = lastDocPages - 1;  // Pages are 0-indexed
+        
+        info "Adding signature to document: " + lastDocId + ", page: " + lastPageNo;
+        
+        // Configure signature field properties
+        fieldObj = Map();
+        fieldObj.put("field_name", "Signature");
+        fieldObj.put("field_type_name", "Signature");
+        fieldObj.put("field_label", "Signature");
+        fieldObj.put("field_category", "image");
+        fieldObj.put("field_type_id", signFieldId);
+        fieldObj.put("document_id", lastDocId);
+        fieldObj.put("page_no", lastPageNo);
+        fieldObj.put("is_mandatory", true);
+        
+        // Signature field position and size
+        // Adjust these values based on your document layout
+        fieldObj.put("x_coord", 295);      // Horizontal position (pixels from left)
+        fieldObj.put("y_coord", 595);      // Vertical position (pixels from top)
+        fieldObj.put("abs_width", 350);    // Field width
+        fieldObj.put("abs_height", 55);    // Field height
+        
+        fieldList = List();
+        fieldList.add(fieldObj);
+        
+        // ====================================================================
+        // STEP 6: CONFIGURE RECIPIENT AND SUBMIT
+        // ====================================================================
+        // Sets up the signer (recipient) and submits the signing request
+        
+        actionObj = Map();
+        actionObj.put("recipient_name", clientName);
+        actionObj.put("recipient_email", clientEmail);
+        actionObj.put("action_type", "SIGN");
+        actionObj.put("fields", fieldList);
+        
+        actionList = List();
+        actionList.add(actionObj);
+        
+        // Build the request payload
+        requestData = Map();
+        requestData.put("actions", actionList);
+        
+        dataWrapper = Map();
+        dataWrapper.put("requests", requestData);
+        
+        // Submit the signing request via API
+        submitUrl = "https://sign.zoho.eu/api/v1/requests/" + requestId + "/submit";
+        
+        paramMap = Map();
+        paramMap.put("data", dataWrapper.toString());
+        
+        submitResp = invokeurl
+        [
+            url: submitUrl
+            type: POST
+            parameters: paramMap
+            connection: "zohosign"
+        ];
+        
+        info "Submit Response: " + submitResp;
+        
+        // ====================================================================
+        // RESULT HANDLING
+        // ====================================================================
+        
+        if(submitResp.get("code") == 0)
+        {
+            info "✅ SUCCESS! All " + pdfFilesList.size() + " PDFs sent as ONE request to " + clientEmail + " for signature!";
+            info "Documents included: " + pdfNames;
+        }
+        else
+        {
+            info "❌ Submit failed: " + submitResp;
+        }
+    }
+    else
+    {
+        info "❌ Upload failed: " + signResponse;
+    }
+}
+else
+{
+    info "⚠️ No PDF files found in task attachments";
+}
+
+return "success";
